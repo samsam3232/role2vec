@@ -3,10 +3,52 @@ import argparse
 from typing import Dict, List
 import numpy as np
 import gensim.downloader
+from collections import defaultdict
 from gensim.models import Word2Vec
 from spacy.tokens import Token
 from tqdm import tqdm
 import spacy
+from spacy.symbols import ORTH
+
+
+def build_tree(doc):
+
+    heads = dict()
+    for token in doc:
+        heads[(token.text, token.i)] = (token.head.text, token.head.i)
+
+    token_list = list(heads.keys())
+    parents = defaultdict(lambda: list())
+    for tok in token_list:
+        curr_token = tok
+        while True:
+            if heads[curr_token] == curr_token:
+                break
+            parents[tok].append(heads[curr_token])
+            curr_token = heads[curr_token]
+
+    return parents
+
+def find_distance(tree: Dict, base_token: Token, dist_token: Token):
+
+    """
+    Given a tree of parents, returns the distance between two tokens.
+    """
+
+    if base_token == dist_token:
+        return 0
+    elif (base_token.text, base_token.i) in tree[(dist_token.text, dist_token.i)]:
+        return tree[(dist_token.text, dist_token.i)].index((base_token.text, base_token.i)) + 1
+    elif (dist_token.text, dist_token.i) in tree[(base_token.text, base_token.i)]:
+        return tree[(base_token.text, base_token.i)].index((dist_token.text, dist_token.i)) + 1
+    else:
+        for sample in tree[(base_token.text, base_token.i)]:
+            if sample in tree[(dist_token.text, dist_token.i)]:
+                break
+        d1 = tree[(base_token.text, base_token.i)].index(sample) + 1
+        d2 = tree[(dist_token.text, dist_token.i)].index(sample) + 1
+        return d1 + d2
+
 
 def need_vectors(line: str, index: int) -> bool:
 
@@ -17,12 +59,16 @@ def need_vectors(line: str, index: int) -> bool:
     :return: Whether we should use the vectors for this word.
     """
 
+    nlp = spacy.load('en_core_web_sm')
+    special_case = [{ORTH: "chef's"}]
+    nlp.tokenizer.add_special_case("chef's", special_case)
+
     split = line.split("##")
     seen = 0
     for i, part in enumerate(split):
         if len(part) > 0:
             real_part = part.strip()
-            num_words = len(real_part.split(" "))
+            num_words = len(nlp(real_part))
             if (seen <= index < (seen + num_words)) and (i%2 == 1):
                 return True
             seen += num_words
@@ -32,14 +78,18 @@ def need_vectors(line: str, index: int) -> bool:
     return False
 
 
-def get_role(token: Token, r2v_type: str = "merged") -> str:
+def get_role(token: Token) -> str:
 
-    if r2v_type == "merged":
-        return f"{token.tag_}_{token.dep_}"
-    elif r2v_type == "dependency":
-        return f"{token.dep_}"
-    else:
-        return f"{token.tag_}"
+    depend = token.dep_
+    if depend[-4:] == "pass":
+        depend = depend[:-4]
+    return depend
+
+
+def find_subject(line: str):
+
+    index = len(line.split("**")[0].replace("##", "").strip().replace("  ", " ").split(" "))
+    return index
 
 
 def treat_line(line: str, w2v: Word2Vec, r2v: Word2Vec, distances: Dict, r2v_type: str = "merged",
@@ -56,25 +106,33 @@ def treat_line(line: str, w2v: Word2Vec, r2v: Word2Vec, distances: Dict, r2v_typ
     :return: A list of all the words and their vectors
     """
 
-    nlp = spacy.load("en_core_web_sm")
+    nlp = spacy.load('en_core_web_sm')
+    special_case = [{ORTH: "chef's"}]
+    nlp.tokenizer.add_special_case("chef's", special_case)
+
     results = list()
+
+    subj_index = find_subject(line)
+    line = line.replace("**", "").strip().replace("  ", " ")
 
     copied_line = line.replace("##", "").strip().replace("  ", " ")
     doc = nlp(copied_line)
+
+    tree = build_tree(doc)
     for i, tok in enumerate(doc):
         if need_vectors(line, i):
-            role = get_role(tok, r2v_type)
+            role = get_role(tok)
             try:
                 role_vec = r2v.wv[role]
-                semant_vec = w2v.get_vector(tok.text.lower().replace(".", ""))
+                semant_vec = w2v.get_vector(tok.text.lower().split("'")[0].replace(".", ""))
             except:
                 print(tok.text)
                 print(role)
                 continue
-            dist = distances[i]
+            dist = distances[str(find_distance(tree, tok, doc[subj_index]))]
 
             role_vec = (role_vec * alpha) + (np.array(dist) * beta)
-            curr_res = {"word": tok.text, "index": i+1, "semantic": semant_vec, "syntactic": role_vec}
+            curr_res = {"word": tok.text, "index": i+1, "semantic": semant_vec.tolist(), "syntactic": role_vec.tolist()}
             results.append(curr_res)
 
     return copied_line, results
